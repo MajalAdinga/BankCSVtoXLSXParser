@@ -11,6 +11,7 @@ namespace BankCSVtoXLSXParser.Parsers
 {
     /// <summary>
     /// Parser for Standard Bank statement exports.
+    /// Supports both legacy and new layouts.
     /// Outputs columns:
     /// Ext. Tran. ID | Ext. Ref. Nbr. | Tran. Date (yyyy-MM-dd) | Tran. Desc | Receipt | Disbursement
     /// </summary>
@@ -28,14 +29,21 @@ namespace BankCSVtoXLSXParser.Parsers
             try
             {
                 if (!File.Exists(filePath)) return false;
-                int headerHits = 0, yyyymmddHits = 0, signedPaddedHits = 0, quotedPatternHits = 0, lines = 0;
+                int headerHits = 0, yyyymmddHits = 0, signedPaddedHits = 0, quotedPatternHits = 0;
+                int newFormatHits = 0, lines = 0;
                 var signedPadded = new Regex(@"^[\+\-]0+\d+(\.\d+)?$");
 
                 foreach (var line in File.ReadLines(filePath))
                 {
                     if (lines++ >= 50) break;
                     if (string.IsNullOrWhiteSpace(line)) continue;
+
+                    string upper = line.ToUpperInvariant();
                     string probe = line.Trim().Trim('"');
+
+                    // New format detection: look for column headers like "Date", "Value Date", "Amount", "Balance"
+                    if (upper.Contains("DATE") && upper.Contains("AMOUNT") && upper.Contains("BALANCE"))
+                        newFormatHits++;
 
                     if (probe.IndexOf("ACC-NO", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         probe.IndexOf("ACCOUNT", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -56,6 +64,10 @@ namespace BankCSVtoXLSXParser.Parsers
                         quotedPatternHits++;
                 }
 
+                // New format: detect structured header + data pattern
+                if (newFormatHits >= 1) return true;
+
+                // Legacy format detection
                 if (headerHits >= 1 && (yyyymmddHits >= 2 || signedPaddedHits >= 2)) return true;
                 if (quotedPatternHits >= 3 && signedPaddedHits >= 2) return true;
                 return false;
@@ -73,6 +85,243 @@ namespace BankCSVtoXLSXParser.Parsers
 
             using (var sr = new StreamReader(filePath))
             {
+                // Detect layout format: new structured or legacy
+                bool isNewFormat = DetectNewFormat(filePath);
+
+                if (isNewFormat)
+                {
+                    ParseNewFormat(filePath, dt, ref sequentialId);
+                }
+                else
+                {
+                    ParseLegacyFormat(filePath, dt, ref sequentialId);
+                }
+            }
+
+            return dt;
+        }
+
+        /// <summary>
+        /// Detects if the file uses the new Standard Bank format with structured headers and metadata.
+        /// New format has Account info in rows 1-14, column headers in row 15, data starting row 16.
+        /// </summary>
+        private bool DetectNewFormat(string filePath)
+        {
+            try
+            {
+                int dateHits = 0, amountHits = 0, balanceHits = 0;
+
+                foreach (var line in File.ReadLines(filePath).Take(20))
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    string upper = line.ToUpperInvariant();
+                    if (upper.Contains("DATE")) dateHits++;
+                    if (upper.Contains("AMOUNT")) amountHits++;
+                    if (upper.Contains("BALANCE")) balanceHits++;
+                }
+
+                return dateHits > 0 && amountHits > 0 && balanceHits > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Parses the new Standard Bank format.
+        /// Structure:
+        /// - Rows 1-14: Metadata (Account info, bank info, currency)
+        /// - Row 15: Column headers (Date | Value Date | Statement Description | Amount | Balance | Type | Originator | Customer Reference)
+        /// - Row 16+: Transaction data
+        /// </summary>
+        private void ParseNewFormat(string filePath, DataTable dt, ref int sequentialId)
+        {
+            using (var sr = new StreamReader(filePath))
+            {
+                string line;
+                int lineNum = 0;
+                bool headerFound = false;
+                int[] columnIndices = new int[8] { -1, -1, -1, -1, -1, -1, -1, -1 };
+                // columnIndices: [Date, ValueDate, Desc, Amount, Balance, Type, Originator, Reference]
+
+                while ((line = sr.ReadLine()) != null)
+                {
+                    lineNum++;
+
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+
+                    // Skip metadata rows (typically rows 1-15)
+                    if (lineNum < 15 || lineNum == 15)
+                    {
+                        // Row 15 contains headers
+                        if (lineNum == 15)
+                        {
+                            headerFound = ParseNewFormatHeaders(line, columnIndices);
+                        }
+                        continue;
+                    }
+
+                    // Parse data rows (starting from row 16)
+                    if (!headerFound) continue;
+
+                    string[] fields;
+                    char detected = CSVHelper.DetectDelimiter(line);
+                    if (line.IndexOf(detected) >= 0)
+                        fields = CSVHelper.SplitCSVLine(line, detected);
+                    else if (Regex.IsMatch(line, @"\s{2,}"))
+                    {
+                        fields = Regex.Split(line.Trim(), @"\s{2,}")
+                                      .Select(v => v.Trim(' ', '\t', '"'))
+                                      .Where(v => v.Length > 0)
+                                      .ToArray();
+                    }
+                    else
+                        fields = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+
+                    // Validate that we have enough fields
+                    if (fields.Length < 4) continue;
+
+                    // Try to parse as transaction row
+                    string dateStr = columnIndices[0] >= 0 && columnIndices[0] < fields.Length
+                        ? fields[columnIndices[0]].Trim()
+                        : fields[0].Trim();
+
+                    if (!IsValidTransactionDate(dateStr)) continue;
+
+                    // Get the description to check for balance rows
+                    string descStr = columnIndices[2] >= 0 && columnIndices[2] < fields.Length
+                        ? fields[columnIndices[2]].Trim()
+                        : (fields.Length > 3 ? fields[3].Trim() : "");
+
+                    // Skip OPENING BALANCE and CLOSING BALANCE rows
+                    if (descStr.IndexOf("OPENING BALANCE", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        descStr.IndexOf("CLOSING BALANCE", StringComparison.OrdinalIgnoreCase) >= 0)
+                        continue;
+
+                    var row = dt.NewRow();
+
+                    // Get the Type column for Ext. Tran. ID - use TYPE value if available
+                    if (columnIndices[5] >= 0 && columnIndices[5] < fields.Length)
+                    {
+                        string typeValue = fields[columnIndices[5]].Trim();
+                        row["Ext. Tran. ID"] = !string.IsNullOrEmpty(typeValue) ? typeValue : sequentialId.ToString();
+                    }
+                    else
+                    {
+                        row["Ext. Tran. ID"] = sequentialId.ToString();
+                    }
+
+                    // Extract fields by column index if available
+                    if (columnIndices[2] >= 0 && columnIndices[2] < fields.Length)
+                        row["Tran. Desc"] = CleanDescription(fields[columnIndices[2]]);
+                    else if (fields.Length > 3)
+                        row["Tran. Desc"] = CleanDescription(fields[3]);
+                    else
+                        row["Tran. Desc"] = "";
+
+                    // Ext. Ref. Nbr.: prefer Originator or Customer Reference
+                    string reference = "";
+                    if (columnIndices[6] >= 0 && columnIndices[6] < fields.Length)
+                        reference = fields[columnIndices[6]].Trim();
+                    if (string.IsNullOrEmpty(reference) && columnIndices[7] >= 0 && columnIndices[7] < fields.Length)
+                        reference = fields[columnIndices[7]].Trim();
+                    row["Ext. Ref. Nbr."] = reference;
+
+                    // Date
+                    row["Tran. Date"] = ConvertDate(dateStr);
+
+                    // Amount: parse and split to Receipt/Disbursement
+                    string amountStr = columnIndices[3] >= 0 && columnIndices[3] < fields.Length
+                        ? fields[columnIndices[3]].Trim()
+                        : (fields.Length > 4 ? fields[4].Trim() : "0");
+
+                    decimal amount;
+                    if (TryParseAmount(amountStr, out amount))
+                        AssignAmount(row, amount);
+                    else
+                        AssignAmount(row, 0m);
+
+                    sequentialId++;
+                    dt.Rows.Add(row);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Parses the header row to identify column positions.
+        /// Looks for: Date, Value Date, Statement Description, Amount, Balance, Type, Originator, Customer Reference
+        /// </summary>
+        private bool ParseNewFormatHeaders(string headerLine, int[] columnIndices)
+        {
+            if (string.IsNullOrWhiteSpace(headerLine)) return false;
+
+            char detected = CSVHelper.DetectDelimiter(headerLine);
+            string[] headers;
+
+            if (headerLine.IndexOf(detected) >= 0)
+                headers = CSVHelper.SplitCSVLine(headerLine, detected);
+            else if (Regex.IsMatch(headerLine, @"\s{2,}"))
+            {
+                headers = Regex.Split(headerLine.Trim(), @"\s{2,}")
+                              .Select(h => h.Trim(' ', '\t', '"'))
+                              .Where(h => h.Length > 0)
+                              .ToArray();
+            }
+            else
+                headers = headerLine.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+
+            for (int i = 0; i < headers.Length; i++)
+            {
+                string h = headers[i].ToUpperInvariant();
+
+                if (h.Contains("DATE") && !h.Contains("VALUE"))
+                    columnIndices[0] = i; // Date
+                else if (h.Contains("VALUE") && h.Contains("DATE"))
+                    columnIndices[1] = i; // Value Date
+                else if (h.Contains("DESCRIPTION") || h.Contains("DESC"))
+                    columnIndices[2] = i; // Statement Description
+                else if (h.Contains("AMOUNT"))
+                    columnIndices[3] = i; // Amount
+                else if (h.Contains("BALANCE"))
+                    columnIndices[4] = i; // Balance
+                else if (h.Contains("TYPE"))
+                    columnIndices[5] = i; // Type
+                else if (h.Contains("ORIGINATOR"))
+                    columnIndices[6] = i; // Originator
+                else if (h.Contains("REFERENCE") || h.Contains("CUSTOMER"))
+                    columnIndices[7] = i; // Customer Reference
+            }
+
+            return columnIndices[0] >= 0; // At minimum, we need Date column
+        }
+
+        /// <summary>
+        /// Validates if a string looks like a transaction date in DD/MM/YYYY or similar format.
+        /// </summary>
+        private bool IsValidTransactionDate(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return false;
+
+            string v = value.Trim();
+
+            // Check DD/MM/YYYY pattern
+            if (Regex.IsMatch(v, @"^\d{1,2}/\d{1,2}/\d{4}$")) return true;
+            if (Regex.IsMatch(v, @"^\d{1,2}-\d{1,2}-\d{4}$")) return true;
+
+            // Check YYYYMMDD pattern
+            if (v.Length == 8 && v.All(char.IsDigit) && v.StartsWith("20")) return true;
+
+            return false;
+        }
+
+        /// <summary>
+        /// Parses the legacy Standard Bank format (old structure without metadata rows).
+        /// </summary>
+        private void ParseLegacyFormat(string filePath, DataTable dt, ref int sequentialId)
+        {
+            using (var sr = new StreamReader(filePath))
+            {
                 string line;
                 while ((line = sr.ReadLine()) != null)
                 {
@@ -80,15 +329,18 @@ namespace BankCSVtoXLSXParser.Parsers
 
                     string upper = line.ToUpperInvariant();
                     if (upper.Contains("ACCOUNT") || upper.StartsWith("\"ALL\"") || upper.Contains("BRANCH") ||
-                        upper.Contains("ACC-NO") || upper.Contains("OPEN BALANCE") || upper.Contains("CLOSE BALANCE"))
+                        upper.Contains("ACC-NO") || upper.Contains("OPEN BALANCE") || upper.Contains("CLOSE BALANCE") ||
+                        upper.Contains("OPENING BALANCE") || upper.Contains("CLOSING BALANCE"))
                         continue;
 
                     string[] fields;
-                    if (IsQuotedStandardBankLine(line)) fields = ParseQuotedStandardBankLine(line);
+                    if (IsQuotedStandardBankLine(line))
+                        fields = ParseQuotedStandardBankLine(line);
                     else
                     {
                         char detected = CSVHelper.DetectDelimiter(line);
-                        if (line.IndexOf(detected) >= 0) fields = CSVHelper.SplitCSVLine(line, detected);
+                        if (line.IndexOf(detected) >= 0)
+                            fields = CSVHelper.SplitCSVLine(line, detected);
                         else if (Regex.IsMatch(line, @"\s{2,}"))
                         {
                             fields = Regex.Split(line.Trim(), @"\s{2,}")
@@ -96,7 +348,8 @@ namespace BankCSVtoXLSXParser.Parsers
                                           .Where(v => v.Length > 0)
                                           .ToArray();
                         }
-                        else fields = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                        else
+                            fields = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                     }
 
                     bool looksQuotedACB = fields.Length >= 5 && IsStdBankDate(fields[1]) && IsSignedPaddedAmount(fields[3]);
@@ -136,8 +389,6 @@ namespace BankCSVtoXLSXParser.Parsers
                     dt.Rows.Add(row);
                 }
             }
-
-            return dt;
         }
 
         private static DataTable NewSchema()
